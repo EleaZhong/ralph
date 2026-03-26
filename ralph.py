@@ -7,9 +7,12 @@ run Claude Code in a loop until completion.
 import argparse
 import json
 import os
+import pathlib
 import subprocess
 import sys
 from dataclasses import dataclass
+
+import yaml
 
 # ---------------------------------------------------------------------------
 # Modular prompt parts registry
@@ -17,11 +20,13 @@ from dataclasses import dataclass
 
 @dataclass
 class PromptPart:
-    name: str           # CLI flag: "verify" → --verify / --no-verify
-    description: str    # Shown in --help
+    name: str           # Used in --parts list
     default: bool       # Enabled by default?
     content: str        # Prompt text (may contain {format} vars)
 
+
+COMPLETION_SIGNAL = "COMPLETE"
+PROGRESS_FILE = "PROGRESS.md"
 
 # Default --allowedTools for non-interactive mode: wide but safe.
 # Read/Grep/Glob are auto-approved by Claude Code so we don't need to list them.
@@ -35,52 +40,24 @@ DEFAULT_ALLOWED_TOOLS = [
     "WebSearch",
 ]
 
-PROMPT_PARTS: list[PromptPart] = [
-    PromptPart(
-        name="small-changes",
-        description="Keep each iteration focused and small",
-        default=True,
-        content=(
-            "You are one iteration of agentic loop to complete this task. "
-            "Keep changes small and focused. Each iteration should accomplish "
-            "one logical unit of work. Do not try to do everything at once."
-        ),
-    ),
-    PromptPart(
-        name="tests",
-        description="Run tests and linting before declaring completion",
-        default=False,
-        content=(
-            "Before declaring completion, run the full test suite and fix any "
-            "failures. Run type checking and linting and fix any issues."
-        ),
-    ),
-    PromptPart(
-        name="progress",
-        description="Maintain an iteration progress log",
-        default=True,
-        content=(
-            "Maintain a progress log in `{progress_file}`. At the start of "
-            "each iteration, read the file to understand prior work. At the "
-            "end, append a concise summary of what you accomplished this "
-            "iteration."
-        ),
-    ),
-    PromptPart(
-        name="checklist",
-        description="Require explicit completion criteria check",
-        default=True,
-        content=(
-            "Do not output the complete signal when you only finish a single task. "
-            "Every task in the prompt should be finished, with all verfication done and logged, "
-            "and everything that needs to be run should be run. "
-            "DO NOT output the signal unless ALL criteria are met, "
-            "and there is nothing at all to do. "
-            "If you are unsure, finish your work without completing, "
-            "and document in the progress file that the next iteration should review everything."
-        ),
-    ),
-]
+# Default parts directory: ./parts/ next to this script
+DEFAULT_PARTS_DIR = pathlib.Path(__file__).parent / "parts"
+
+
+def load_parts(parts_dir: pathlib.Path) -> list[PromptPart]:
+    """Load all PromptPart definitions from YAML files in a directory."""
+    parts = []
+    if not parts_dir.is_dir():
+        return parts
+    for yaml_file in sorted(parts_dir.glob("*.yaml")):
+        with open(yaml_file) as f:
+            data = yaml.safe_load(f)
+        parts.append(PromptPart(
+            name=data["name"],
+            default=data.get("default", False),
+            content=data.get("content", "").strip(),
+        ))
+    return parts
 
 # ---------------------------------------------------------------------------
 # Prompt assembly
@@ -88,23 +65,20 @@ PROMPT_PARTS: list[PromptPart] = [
 
 def assemble_prompt(
     user_prompt: str,
-    enabled_parts: dict[str, bool],
-    completion_signal: str,
-    progress_file: str,
+    active_parts: list[PromptPart],
 ) -> str:
     fmt = dict(
-        completion_signal=completion_signal,
-        progress_file=progress_file,
+        completion_signal=COMPLETION_SIGNAL,
+        progress_file=PROGRESS_FILE,
     )
 
     sections = [user_prompt.strip()]
 
-    active = [p for p in PROMPT_PARTS if enabled_parts.get(p.name, p.default)]
     lines = ["", "## Iteration Protocol"]
-    for part in active:
+    for part in active_parts:
         lines.append(f"- {part.content.format(**fmt)}")
     lines.append(
-        f'- When ALL completion criteria are met, output the exact line: {completion_signal}'
+        f'- When ALL completion criteria are met, output the exact line: {COMPLETION_SIGNAL}'
     )
     sections.append("\n".join(lines))
 
@@ -114,10 +88,31 @@ def assemble_prompt(
 # CLI
 # ---------------------------------------------------------------------------
 
+def _parts_help(parts_dir: pathlib.Path) -> str:
+    """Build help text listing all available parts with their prompts."""
+    parts = load_parts(parts_dir)
+    if not parts:
+        return "No parts found."
+    lines = []
+    for p in parts:
+        default_tag = " (default)" if p.default else ""
+        lines.append(f"  {p.name}{default_tag}:")
+        # Wrap content to ~70 chars indented
+        for content_line in p.content.splitlines():
+            lines.append(f"    {content_line.strip()}")
+    return "\n".join(lines)
+
+
 def build_parser() -> argparse.ArgumentParser:
+    parts_help = _parts_help(DEFAULT_PARTS_DIR)
+
     p = argparse.ArgumentParser(
         description="Run Claude Code in a loop until completion.",
-        epilog="Anything after -- is passed directly to `claude -p`.",
+        epilog=(
+            "Anything after -- is passed directly to `claude`.\n\n"
+            "Available parts:\n" + parts_help
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument(
         "prompt_file",
@@ -133,18 +128,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "-n", "--max-iterations",
         type=int,
-        default=30,
-        help="Maximum loop iterations (default: 30).",
-    )
-    p.add_argument(
-        "--completion-signal",
-        default="COMPLETE",
-        help='String that signals completion (default: "COMPLETE").',
-    )
-    p.add_argument(
-        "--progress-file",
-        default="PROGRESS.md",
-        help="Path to the progress log file (default: PROGRESS.md).",
+        default=10,
+        help="Maximum loop iterations (default: 10).",
     )
     p.add_argument(
         "--dry-run",
@@ -152,37 +137,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print the assembled prompt and exit.",
     )
     p.add_argument(
-        "--list-parts",
-        action="store_true",
-        help="List all available prompt parts and exit.",
-    )
-    p.add_argument(
-        "--yolo",
-        action="store_true",
+        "--parts",
+        nargs="*",
+        default=None,
         help=(
-            "Use --dangerously-skip-permissions with IS_SANDBOX=1 "
-            "(for containerised / throwaway environments)."
+            "List of prompt parts to enable (by name). "
+            "If omitted, all parts with default=true are enabled. "
+            "Example: --parts small-changes tests progress"
         ),
     )
     p.add_argument(
-        "--no-allow-defaults",
+        "--parts-dir",
+        default=None,
+        help=f"Directory containing part YAML files (default: {DEFAULT_PARTS_DIR}).",
+    )
+    p.add_argument(
+        "--safe",
         action="store_true",
         help=(
-            "Do not inject the default --allowedTools set. "
-            "By default, Edit/Write/Bash/Agent/NotebookEdit/WebFetch/WebSearch "
-            "are pre-approved for non-interactive use."
+            "Use --allowedTools instead of --dangerously-skip-permissions. "
+            "By default, runs in yolo mode (skip permissions + IS_SANDBOX=1)."
         ),
     )
-
-    # Auto-generate --{name} / --no-{name} for each prompt part
-    parts_group = p.add_argument_group("prompt parts (each has --X / --no-X)")
-    for part in PROMPT_PARTS:
-        parts_group.add_argument(
-            f"--{part.name}",
-            action=argparse.BooleanOptionalAction,
-            default=None,
-            help=f"{'[ON] ' if part.default else '[OFF] '}{part.description}",
-        )
 
     return p
 
@@ -198,15 +174,28 @@ def resolve_prompt(args: argparse.Namespace) -> str:
     return sys.stdin.read()
 
 
-def resolve_enabled_parts(args: argparse.Namespace) -> dict[str, bool]:
-    enabled = {}
-    for part in PROMPT_PARTS:
-        flag_val = getattr(args, part.name.replace("-", "_"), None)
-        if flag_val is not None:
-            enabled[part.name] = flag_val
-        else:
-            enabled[part.name] = part.default
-    return enabled
+def resolve_active_parts(
+    all_parts: list[PromptPart], selected: list[str] | None,
+) -> list[PromptPart]:
+    """Return the list of active PromptParts based on --parts selection.
+
+    If selected is None (flag omitted), use each part's default.
+    If selected is an explicit list, enable exactly those parts.
+    """
+    if selected is None:
+        return [p for p in all_parts if p.default]
+    by_name = {p.name: p for p in all_parts}
+    active = []
+    for name in selected:
+        if name not in by_name:
+            available = ", ".join(sorted(by_name))
+            print(
+                f"Error: unknown part '{name}'. Available: {available}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        active.append(by_name[name])
+    return active
 
 # ---------------------------------------------------------------------------
 # Streaming execution
@@ -283,22 +272,16 @@ def _run_streaming(
 # ---------------------------------------------------------------------------
 
 def run(args: argparse.Namespace, claude_args: list[str]) -> int:
-    enabled = resolve_enabled_parts(args)
-
-    if args.list_parts:
-        for part in PROMPT_PARTS:
-            state = "ON" if enabled[part.name] else "OFF"
-            print(f"  [{state}]  --{part.name:20s} {part.description}")
-        return 0
+    parts_dir = pathlib.Path(args.parts_dir) if args.parts_dir else DEFAULT_PARTS_DIR
+    all_parts = load_parts(parts_dir)
+    active_parts = resolve_active_parts(all_parts, args.parts)
 
     user_prompt = resolve_prompt(args)
     if not user_prompt.strip():
         print("Error: empty prompt.", file=sys.stderr)
         return 1
 
-    full_prompt = assemble_prompt(
-        user_prompt, enabled, args.completion_signal, args.progress_file,
-    )
+    full_prompt = assemble_prompt(user_prompt, active_parts)
 
     if args.dry_run:
         print(full_prompt)
@@ -307,18 +290,18 @@ def run(args: argparse.Namespace, claude_args: list[str]) -> int:
     # -- Permission / tool-approval flags --------------------------------
     env = os.environ.copy()
 
-    if args.yolo:
-        if "--dangerously-skip-permissions" not in claude_args:
-            claude_args = ["--dangerously-skip-permissions"] + claude_args
-        env["IS_SANDBOX"] = "1"
-    elif not args.no_allow_defaults:
-        # Inject a broad-but-safe --allowedTools set so claude -p can
-        # actually do work without interactive approval prompts.
+    if args.safe:
+        # Safe mode: use --allowedTools instead of skipping permissions
         for tool in DEFAULT_ALLOWED_TOOLS:
             if f"--allowedTools={tool}" not in claude_args:
                 claude_args += ["--allowedTools", tool]
+    else:
+        # Default: yolo mode
+        if "--dangerously-skip-permissions" not in claude_args:
+            claude_args = ["--dangerously-skip-permissions"] + claude_args
+        env["IS_SANDBOX"] = "1"
 
-    cmd_base = ["claude", "-p", "--output-format", "stream-json", "--verbose"] + claude_args
+    cmd_base = ["claude", "-p", "--output-format", "stream-json", "--verbose", "--effort", "high"] + claude_args
 
     for i in range(1, args.max_iterations + 1):
         print(f"\n{'='*60}", file=sys.stderr)
@@ -329,7 +312,7 @@ def run(args: argparse.Namespace, claude_args: list[str]) -> int:
 
         # Strict signal check: exact match on a stripped line
         if any(
-            line.strip() == args.completion_signal
+            line.strip() == COMPLETION_SIGNAL
             for line in collected_text.splitlines()
         ):
             print(f"\n✓ Completed after {i} iteration(s).", file=sys.stderr)

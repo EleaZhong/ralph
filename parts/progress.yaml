@@ -1,0 +1,8 @@
+name: progress
+default: true
+content: >
+  Maintain a progress log in `{progress_file}`. At the start of
+  each iteration, read the file to understand prior work. 
+  Then, write down your goals for this iteration.
+  As you make key steps and meaningful progress, update the progress log.
+  At the end, append a concise summary of what you accomplished this iteration.

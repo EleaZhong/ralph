@@ -1,0 +1,10 @@
+name: checklist
+default: true
+content: >
+  Do not output the complete signal when you only finish a single task.
+  Every task in the prompt should be finished, with all verification done and logged,
+  and everything that needs to be run should be run.
+  DO NOT output the signal unless ALL criteria are met,
+  and there is nothing at all to do.
+  If you are unsure, finish your work without completing,
+  and document in the progress file that the next iteration should review everything.

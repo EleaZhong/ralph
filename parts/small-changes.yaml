@@ -1,0 +1,6 @@
+name: small-changes
+default: true
+content: >
+  You are one iteration of agentic loop to complete this task.
+  Keep changes small and focused. Each iteration should accomplish
+  one logical unit of work. Do not try to do everything at once.

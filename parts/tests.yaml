@@ -1,0 +1,5 @@
+name: tests
+default: false
+content: >
+  Before declaring completion, run the full test suite and fix any
+  failures. Run type checking and linting and fix any issues.
