@@ -221,49 +221,59 @@ def _run_streaming(
     proc.stdin.close()
 
     collected: list[str] = []
-    assert proc.stdout is not None
-    for raw_line in proc.stdout:
-        raw_line = raw_line.rstrip("\n")
-        if not raw_line:
-            continue
+    try:
+        assert proc.stdout is not None
+        for raw_line in proc.stdout:
+            raw_line = raw_line.rstrip("\n")
+            if not raw_line:
+                continue
+            try:
+                msg = json.loads(raw_line)
+            except json.JSONDecodeError:
+                print(raw_line, flush=True)
+                collected.append(raw_line + "\n")
+                continue
+
+            # stream-json schema:
+            #   assistant: {type: "assistant", message: {content: [{type: "text", text: "..."}]}}
+            #   result:    {type: "result", result: "final text"}
+            msg_type = msg.get("type", "")
+
+            if msg_type == "assistant":
+                for block in msg.get("message", {}).get("content", []):
+                    if block.get("type") == "text":
+                        text = block.get("text", "")
+                        if text:
+                            print(text, end="", flush=True)
+                            collected.append(text)
+            elif msg_type == "result":
+                result_text = msg.get("result", "")
+                if isinstance(result_text, str) and result_text:
+                    # Only use result text if we didn't already stream it
+                    if not collected:
+                        print(result_text, end="", flush=True)
+                    collected.append(result_text)
+
+        # Ensure a trailing newline after streamed output
+        if collected:
+            print(flush=True)
+
+        # Drain stderr
+        assert proc.stderr is not None
+        stderr_out = proc.stderr.read()
+        if stderr_out:
+            print(stderr_out, file=sys.stderr)
+
+        proc.wait()
+    except (KeyboardInterrupt, Exception):
+        proc.terminate()
         try:
-            msg = json.loads(raw_line)
-        except json.JSONDecodeError:
-            print(raw_line, flush=True)
-            collected.append(raw_line + "\n")
-            continue
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        raise
 
-        # stream-json schema:
-        #   assistant: {type: "assistant", message: {content: [{type: "text", text: "..."}]}}
-        #   result:    {type: "result", result: "final text"}
-        msg_type = msg.get("type", "")
-
-        if msg_type == "assistant":
-            for block in msg.get("message", {}).get("content", []):
-                if block.get("type") == "text":
-                    text = block.get("text", "")
-                    if text:
-                        print(text, end="", flush=True)
-                        collected.append(text)
-        elif msg_type == "result":
-            result_text = msg.get("result", "")
-            if isinstance(result_text, str) and result_text:
-                # Only use result text if we didn't already stream it
-                if not collected:
-                    print(result_text, end="", flush=True)
-                collected.append(result_text)
-
-    # Ensure a trailing newline after streamed output
-    if collected:
-        print(flush=True)
-
-    # Drain stderr
-    assert proc.stderr is not None
-    stderr_out = proc.stderr.read()
-    if stderr_out:
-        print(stderr_out, file=sys.stderr)
-
-    proc.wait()
     return "".join(collected), proc.returncode
 
 
